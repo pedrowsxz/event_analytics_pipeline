@@ -1,0 +1,555 @@
+"""
+generate_data.py
+================
+Generates a large synthetic events CSV (1–3 million rows) using NumPy for
+all data generation. No Python-level row loops are used anywhere in the hot
+path.
+
+Design decisions are explained in-line as "# [DESIGN]" comments so every
+non-obvious choice is traceable.
+
+Usage
+-----
+    python generate_data.py                  # 3 000 000 rows  → events.csv
+    python generate_data.py 1000000          # custom row count
+    python generate_data.py 3000000 out.csv  # custom output path
+
+Requirements
+------------
+    pip install numpy pandas pyarrow  # pyarrow makes to_csv 2-3× faster
+"""
+
+import sys
+import time
+import uuid
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+N_ROWS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 3_000_000
+OUTPUT_PATH: Path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("events.csv")
+
+RNG_SEED = 42
+
+# Event-type probabilities (must sum ≤ 1; remainder = page_view)
+# [DESIGN] We model the rare types first so their shares are exact; page_view
+# absorbs all remaining probability mass.
+PURCHASE_RATE  = 0.035   # 3.5 % → satisfies "2–5 %"
+REFUND_RATE    = 0.003   # 0.3 % → satisfies "0.1–0.5 %"
+SIGNUP_RATE    = 0.05    # 5 %
+# page_view = 1 - PURCHASE_RATE - REFUND_RATE - SIGNUP_RATE ≈ 91.2 %
+
+# Dirty-data injection rates (each independently 0.5 %)
+DIRTY_RATE = 0.005
+
+# Lognormal parameters for purchase amounts
+# E[X] = exp(μ + σ²/2).  With μ=3.5, σ=1.2 → mean ≈ $60, long tail up to
+# several thousand dollars — realistic for an e-commerce platform.
+LOGNORMAL_MU    = 3.5
+LOGNORMAL_SIGMA = 1.2
+
+# Timestamp range: 2023-01-01 → 2024-12-31
+TS_START = int(pd.Timestamp("2023-01-01", tz="UTC").timestamp())
+TS_END   = int(pd.Timestamp("2024-12-31 23:59:59", tz="UTC").timestamp())
+
+COUNTRIES = ["BR", "US", "MX", "DE", "FR", "GB", "IN", "CA", "AU", "JP"]
+DEVICES   = ["ios", "android", "web"]
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def section(msg: str) -> None:
+    print(f"\n{'─'*60}\n  {msg}\n{'─'*60}")
+
+
+def elapsed(t0: float) -> str:
+    return f"{time.perf_counter() - t0:.2f}s"
+
+
+# ---------------------------------------------------------------------------
+# Step 1 – Event-type generation (vectorised with np.searchsorted)
+# ---------------------------------------------------------------------------
+# [DESIGN] How to vectorise event_type generation efficiently
+# -----------------------------------------------------------
+# We draw a single uniform random array of shape (N,) and partition it into
+# buckets using a cumulative-probability boundary array.  np.searchsorted
+# maps every float to a bucket index in O(N log k) where k=4 — no Python
+# loop, no repeated np.where chains.
+#
+#   0                0.003     0.038    0.088            1.0
+#   |── refund ────|── pur ──|─ sig ─|────── page_view ──|
+#
+# The ordering (rarest first) keeps the boundary array tidy but has no
+# correctness impact.
+
+EVENT_LABELS   = np.array(["refund", "purchase", "signup", "page_view"], dtype="U9")
+EVENT_BOUNDS   = np.array([REFUND_RATE,
+                            REFUND_RATE + PURCHASE_RATE,
+                            REFUND_RATE + PURCHASE_RATE + SIGNUP_RATE])
+
+
+def generate_event_types(rng: np.random.Generator, n: int) -> np.ndarray:
+    """Return an array of event-type strings, shape (n,), no Python loops."""
+    u = rng.uniform(0, 1, size=n)
+    # searchsorted returns 0,1,2,3 → index into EVENT_LABELS
+    indices = np.searchsorted(EVENT_BOUNDS, u, side="left")
+    return EVENT_LABELS[indices]          # fancy-indexing: fully vectorised
+
+
+# ---------------------------------------------------------------------------
+# Step 2 – Enforce refund → purchase dependency without loops
+# ---------------------------------------------------------------------------
+# [DESIGN] Enforcing the refund ↔ purchase constraint
+# ---------------------------------------------------
+# Naively, we could assign refunds randomly — but the spec says a refund must
+# correspond to an existing purchase.  We do this in two vectorised passes:
+#
+#   Pass A: collect all purchase row indices → purchase_idx (an integer array)
+#   Pass B: for every refund row, pick a random purchase_idx to "link to".
+#           np.random.choice(purchase_idx, size=n_refunds, replace=True)
+#           is an O(n_refunds) vectorised operation.
+#
+# The resulting session_id column links each refund to the session_id of a
+# real purchase row, which satisfies the dependency.  No Python loop needed.
+#
+# [FIX 1] The function now returns the raw index arrays (refund_indices,
+# linked_purchase_indices) alongside the updated session_ids.  The caller
+# uses them to set amounts[refund_indices] = -amounts[linked_purchase_indices],
+# ensuring each refund's amount exactly mirrors its linked purchase.
+#
+# [FIX 2] The caller also uses linked_purchase_indices to build a
+# protected_purchase_mask that shields those rows from event_type corruption
+# during dirty-data injection, preserving the invariant after injection.
+
+def link_refunds_to_purchases(
+    event_types: np.ndarray,
+    session_ids: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    For every refund row, replace its session_id with the session_id of a
+    randomly chosen purchase row, establishing the refund→purchase link.
+
+    Returns
+    -------
+    session_ids_out      : np.ndarray  – updated session_ids (copy)
+    refund_indices       : np.ndarray  – row positions of refund events
+    linked_purchase_idx  : np.ndarray  – for each refund, the row position of
+                                         its linked purchase (parallel to
+                                         refund_indices)
+    """
+    purchase_mask = event_types == "purchase"
+    refund_mask   = event_types == "refund"
+
+    n_purchases = purchase_mask.sum()
+
+    if n_purchases == 0:
+        # Edge case: no purchases at all — demote refunds to page_view
+        event_types[refund_mask] = "page_view"
+        empty = np.empty(0, dtype=np.intp)
+        return session_ids, empty, empty
+
+    # [DESIGN] np.where(refund_mask) returns an integer index array — no loop.
+    refund_indices   = np.where(refund_mask)[0]          # shape: (n_refunds,)
+    purchase_indices = np.where(purchase_mask)[0]        # shape: (n_purchases,)
+
+    # Pick a random purchase for each refund (with replacement — realistic)
+    linked_purchase_idx = rng.choice(purchase_indices, size=len(refund_indices), replace=True)
+
+    # Assign the purchase's session_id to the refund row
+    out = session_ids.copy()
+    out[refund_indices] = session_ids[linked_purchase_idx]
+    return out, refund_indices, linked_purchase_idx
+
+
+# ---------------------------------------------------------------------------
+# Step 3 – Inject dirty data without loops
+# ---------------------------------------------------------------------------
+# [DESIGN] Dirty-data injection without Python loops
+# --------------------------------------------------
+# We compute a boolean mask for each corruption type using a single
+# rng.random(n) < DIRTY_RATE comparison — this is a vectorised boolean
+# array.  Then:
+#
+#   • Invalid timestamps  → assign a fixed out-of-range integer (year 2099).
+#   • Null countries      → assign empty string ""; becomes NaN after
+#                           pd.Categorical if desired, or stays "" for CSV.
+#   • Invalid event_type  → assign the sentinel string "???".
+#   • Duplicate event_id  → copy the event_id from a random source row using
+#                           fancy indexing on a pre-mutation snapshot.
+#
+# All four injections use fancy indexing on NumPy arrays — O(n) vectorised.
+#
+# [FIX 2] protected_purchase_mask is a boolean array that is True for every
+# purchase row that at least one refund depends on.  It is AND-ed out of
+# etype_mask so those rows can never receive the "???" sentinel, preserving
+# the refund → purchase invariant after dirty injection.
+# Other dirty types (timestamps, countries) are intentionally still allowed
+# on protected rows — the invariant only requires event_type == "purchase".
+#
+# [FIX 3] Duplicate injection:
+#   • We take a snapshot of event_ids before any mutation so that
+#     event_ids[dup_indices] = snapshot[src] is always a copy from an
+#     original value — no "chain duplicates" where a row copies from a row
+#     that was itself already overwritten.
+#   • Self-copies (src == target index) are eliminated by shifting src by +1
+#     mod n, which is a single vectorised assignment — no Python loop.
+#     The shift introduces negligible distribution bias at millions of rows.
+
+INVALID_TS = int(pd.Timestamp("2099-01-01", tz="UTC").timestamp())  # year 2099
+
+
+def inject_dirty_data(
+    rng:                    np.random.Generator,
+    n:                      int,
+    timestamps:             np.ndarray,      # int64
+    countries:              np.ndarray,      # object/str
+    event_types:            np.ndarray,      # str
+    event_ids:              np.ndarray,      # int64
+    protected_purchase_mask: np.ndarray,     # bool, shape (n,) — [FIX 2]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Mutate arrays in-place and return them."""
+
+    # Independent masks — each ~0.5 % of rows
+    r = rng.random((4, n))                         # shape (4, N), one draw
+
+    ts_mask      = r[0] < DIRTY_RATE
+    country_mask = r[1] < DIRTY_RATE
+    # [FIX 2] Exclude protected purchase rows from event_type corruption.
+    etype_mask   = (r[2] < DIRTY_RATE) & ~protected_purchase_mask
+    dup_mask     = r[3] < DIRTY_RATE
+
+    # 1. Invalid timestamps
+    timestamps[ts_mask] = INVALID_TS
+
+    # 2. Null countries (empty string → treat as null in downstream pipelines)
+    countries[country_mask] = ""
+
+    # 3. Invalid event_type
+    event_types[etype_mask] = "???"
+
+    # 4. Duplicate event_ids — [FIX 3]
+    n_dups = dup_mask.sum()
+    if n_dups > 0:
+        dup_indices = np.where(dup_mask)[0]          # exact target positions
+
+        # Snapshot before ANY mutation so chain-duplicates are impossible.
+        ids_snapshot = event_ids.copy()
+
+        # Draw source positions; ensure no self-copies in one vectorised step.
+        src = rng.integers(0, n, size=n_dups)
+        self_copy = src == dup_indices               # bool mask, shape (n_dups,)
+        src[self_copy] = (src[self_copy] + 1) % n   # shift by 1, wrap around
+
+        # Copy from the original snapshot — never from a row already mutated.
+        event_ids[dup_indices] = ids_snapshot[src]
+
+    return timestamps, countries, event_types, event_ids
+
+
+# ---------------------------------------------------------------------------
+# Step 4 – Memory-efficient considerations
+# ---------------------------------------------------------------------------
+# [DESIGN] Memory discipline for 3 M rows
+# ----------------------------------------
+# At 3 M rows × 8 columns a naïve approach wastes GB of RAM.  We apply:
+#
+#   • int32 for user_id, session_id        → 4 B/cell vs 8 B
+#   • int64 for timestamps (Unix seconds)  → compact, no object overhead
+#   • float32 for amount                   → 4 B, sufficient for cents
+#   • pd.Categorical for event_type, country, device (≤10 distinct values)
+#     A Categorical column stores one int8 code per row + a tiny lookup table
+#     → ~1 B/row instead of ~50 B/row for a Python string object.
+#   • We build all columns as NumPy arrays first, then construct one
+#     DataFrame at the end — avoids repeated reallocation.
+#   • We write CSV via to_csv() with chunksize to cap peak memory; for very
+#     large files pyarrow's write_csv is 3-4× faster and memory-friendlier.
+#
+# Rough RAM budget for 3 M rows after dtype discipline:
+#   event_id   : int64  24 MB
+#   user_id    : int32  12 MB
+#   ts         : int64  24 MB
+#   event_type : Cat    ~3 MB   (int8 codes)
+#   amount     : float32 12 MB
+#   country    : Cat    ~3 MB
+#   device     : Cat    ~3 MB
+#   session_id : int32  12 MB
+#   ─────────────────────────
+#   Total ≈ 93 MB  (vs ~1.8 GB with object columns + int64 everywhere)
+
+
+# ---------------------------------------------------------------------------
+# Main generation function
+# ---------------------------------------------------------------------------
+
+def generate(n: int, rng: np.random.Generator) -> pd.DataFrame:
+    section(f"Generating {n:,} rows")
+    t0 = time.perf_counter()
+
+    # ── IDs ──────────────────────────────────────────────────────────────
+    # [DESIGN] Integer event_ids are generated as a shuffle of [0, n) so
+    # they start as unique; dirty-data injection will intentionally create
+    # ~0.5 % collisions afterward.
+    event_ids  = rng.permutation(n).astype(np.int64)
+    user_ids   = rng.integers(1, 500_001, size=n, dtype=np.int32)
+    session_ids = rng.integers(1, 2_000_001, size=n, dtype=np.int32)
+
+    print(f"  IDs generated          {elapsed(t0)}")
+
+    # ── Timestamps ───────────────────────────────────────────────────────
+    # [DESIGN] Draw uniform integers in [TS_START, TS_END] — second-level
+    # resolution, no Python datetime objects until the final conversion.
+    timestamps = rng.integers(TS_START, TS_END + 1, size=n, dtype=np.int64)
+
+    print(f"  Timestamps generated   {elapsed(t0)}")
+
+    # ── Event types (vectorised bucket method) ────────────────────────────
+    event_types = generate_event_types(rng, n)
+    print(f"  Event types generated  {elapsed(t0)}")
+
+    # ── Refund → purchase linkage ─────────────────────────────────────────
+    # [FIX 1 & 2] link_refunds_to_purchases now also returns the raw index
+    # arrays so we can (a) mirror amounts exactly and (b) build the
+    # protected_purchase_mask that shields those rows from event_type corruption.
+    session_ids_linked, refund_indices, linked_purchase_indices = (
+        link_refunds_to_purchases(event_types, session_ids.copy(), rng)
+    )
+    session_ids = session_ids_linked.astype(np.int32)
+
+    # [FIX 2] Mark every purchase row that at least one refund depends on.
+    # np.zeros + index assignment is O(n_linked) — fully vectorised.
+    protected_purchase_mask = np.zeros(N_ROWS, dtype=bool)
+    if len(linked_purchase_indices):
+        protected_purchase_mask[linked_purchase_indices] = True
+
+    print(f"  Refund links resolved  {elapsed(t0)}")
+
+    # ── Countries & devices ───────────────────────────────────────────────
+    # [DESIGN] rng.integers picks random indices into the lookup lists;
+    # fancy indexing maps them to strings — fully vectorised.
+    country_arr = np.array(COUNTRIES)
+    device_arr  = np.array(DEVICES)
+
+    country_idx = rng.integers(0, len(country_arr), size=n)
+    device_idx  = rng.integers(0, len(device_arr), size=n)
+
+    countries   = country_arr[country_idx]    # object array of strings
+    devices     = device_arr[device_idx]
+
+    print(f"  Countries/devices gen  {elapsed(t0)}")
+
+    # ── Amounts (lognormal, purchase/refund only) ─────────────────────────
+    # [DESIGN] Draw lognormal for all rows — cheap — then zero-out non-
+    # purchase rows with a boolean mask.  Avoids conditional loops.
+    #
+    # [FIX 1] Refund amounts must exactly equal -purchase.amount of the
+    # linked purchase, not an independent random sample.  Sequence:
+    #   1. Generate lognormal amounts for every row.
+    #   2. Zero out every row that is not a purchase.
+    #   3. Copy -amounts[linked_purchase_indices] → amounts[refund_indices].
+    # Steps 2 and 3 are single boolean-mask / fancy-index assignments —
+    # no Python loop.
+    raw_amounts = rng.lognormal(mean=LOGNORMAL_MU, sigma=LOGNORMAL_SIGMA, size=n)
+    amounts = raw_amounts.astype(np.float32)
+
+    purchase_mask = event_types == "purchase"
+    amounts[~purchase_mask] = 0.0                               # zero everything that isn't a purchase
+
+    if len(refund_indices):
+        # Mirror the exact purchase amount, negated — one fancy-index op.
+        amounts[refund_indices] = -amounts[linked_purchase_indices]
+
+    print(f"  Amounts generated      {elapsed(t0)}")
+
+    # ── Dirty data injection ──────────────────────────────────────────────
+    timestamps, countries, event_types, event_ids = inject_dirty_data(
+        rng, n, timestamps, countries, event_types, event_ids,
+        protected_purchase_mask,                               # [FIX 2]
+    )
+    print(f"  Dirty data injected    {elapsed(t0)}")
+
+    # ── Assemble DataFrame with dtype discipline ──────────────────────────
+    # [DESIGN] pd.Categorical for low-cardinality string columns.
+    # This is the single biggest memory win: each cell goes from ~50 bytes
+    # (Python str object) to 1 byte (int8 category code).
+    df = pd.DataFrame(
+        {
+            "event_id":   pd.array(event_ids,  dtype="int64"),
+            "user_id":    pd.array(user_ids,   dtype="int32"),
+            "ts":         pd.to_datetime(timestamps, unit="s", utc=True),
+            "event_type": pd.Categorical(event_types),
+            "amount":     pd.array(amounts, dtype="float32"),
+            "country":    pd.Categorical(countries),
+            "device":     pd.Categorical(devices),
+            "session_id": pd.array(session_ids, dtype="int32"),
+        }
+    )
+
+    print(f"  DataFrame assembled    {elapsed(t0)}")
+    return df, refund_indices, linked_purchase_indices
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+def report(
+    df: pd.DataFrame,
+    refund_indices: np.ndarray,
+    linked_purchase_indices: np.ndarray,
+) -> None:
+    section("Dataset Summary")
+    n = len(df)
+
+    counts = df["event_type"].value_counts(dropna=False)
+    print(f"  Total rows         : {n:>12,}")
+    print(f"  Unique event_ids   : {df['event_id'].nunique():>12,}")
+    print()
+    print("  Event-type breakdown:")
+    for etype, cnt in counts.items():
+        print(f"    {str(etype):<12} {cnt:>10,}  ({cnt/n*100:5.2f} %)")
+
+    print()
+    print("  Dirty-data checks:")
+    invalid_ts    = (df["ts"].dt.year >= 2099).sum()
+    null_country  = (df["country"].astype(str) == "").sum()
+    invalid_etype = (df["event_type"].astype(str) == "???").sum()
+    dup_ids       = n - df["event_id"].nunique()
+    print(f"    Invalid timestamps : {invalid_ts:>10,}  ({invalid_ts/n*100:.2f} %)")
+    print(f"    Null countries     : {null_country:>10,}  ({null_country/n*100:.2f} %)")
+    print(f"    Invalid event_type : {invalid_etype:>10,}  ({invalid_etype/n*100:.2f} %)")
+    print(f"    Duplicate event_id : {dup_ids:>10,}  ({dup_ids/n*100:.2f} %)")
+
+    print()
+    purchase_amounts = df.loc[df["event_type"] == "purchase", "amount"]
+    if len(purchase_amounts):
+        print("  Purchase amount stats:")
+        print(f"    Min    : ${purchase_amounts.min():>10.2f}")
+        print(f"    Median : ${purchase_amounts.median():>10.2f}")
+        print(f"    Mean   : ${purchase_amounts.mean():>10.2f}")
+        print(f"    Max    : ${purchase_amounts.max():>10.2f}")
+
+    # ── Invariant verification ────────────────────────────────────────────
+    # [DESIGN] All three checks use the exact row-index arrays returned by
+    # generate() — no session_id join, no ambiguity from shared session_ids.
+    #
+    #   Inv 1: event_types[linked_purchase_indices] are all "purchase".
+    #          One boolean fancy-index + .all().
+    #
+    #   Inv 2: amounts[refund_indices] == -amounts[linked_purchase_indices].
+    #          Two fancy-index reads + np.isclose, fully vectorised.
+    #
+    #   Inv 3: Duplicate of Inv 1, confirming the condition still holds
+    #          post dirty injection (same check, run after injection).
+    #
+    # Using direct integer index arrays avoids the ambiguity of matching on
+    # session_id (multiple purchases can share a session_id).
+    print()
+    print("  Invariant checks (must all PASS):")
+
+    if len(refund_indices) == 0:
+        print("    [SKIP] No refund rows — invariants vacuously satisfied.")
+    else:
+        amounts_arr    = df["amount"].to_numpy(dtype="float32")
+        etypes_arr     = df["event_type"].astype(str).to_numpy()
+
+        # Inv 1 & 3 — linked row still has event_type == "purchase"
+        # (same check; run after injection, so this confirms post-injection state)
+        linked_etypes  = etypes_arr[linked_purchase_indices]          # fancy index
+        inv1_ok        = bool((linked_etypes == "purchase").all())
+        n_not_purchase = int((linked_etypes != "purchase").sum())
+        print(f"    [{'PASS' if inv1_ok else 'FAIL'}] "
+              f"Every linked row has event_type=='purchase' "
+              f"(violations: {n_not_purchase})")
+
+        # Inv 2 — refund.amount == -purchase.amount (exact row match)
+        refund_amounts   = amounts_arr[refund_indices]                # fancy index
+        purchase_amounts_linked = amounts_arr[linked_purchase_indices] # fancy index
+        match            = np.isclose(refund_amounts, -purchase_amounts_linked, atol=1e-4)
+        inv2_ok          = bool(match.all())
+        n_mismatch       = int((~match).sum())
+        print(f"    [{'PASS' if inv2_ok else 'FAIL'}] "
+              f"refund.amount == -purchase.amount (mismatches: {n_mismatch})")
+
+    print()
+    print("  Memory usage (DataFrame):")
+    mem = df.memory_usage(deep=True)
+    for col, b in mem.items():
+        if col == "Index":
+            continue
+        print(f"    {col:<12} {b/1024**2:>7.1f} MB")
+    print(f"    {'TOTAL':<12} {mem.sum()/1024**2:>7.1f} MB")
+
+
+# ---------------------------------------------------------------------------
+# Write output
+# ---------------------------------------------------------------------------
+
+def write_csv(df: pd.DataFrame, path: Path) -> None:
+    section(f"Writing → {path}")
+    t0 = time.perf_counter()
+
+    # [DESIGN] pyarrow's CSV writer is significantly faster and streams data
+    # without materialising the entire string representation in RAM.
+    # We fall back to pandas if pyarrow is unavailable.
+    try:
+        import pyarrow as pa
+        import pyarrow.csv as pacsv
+
+        # pyarrow does not natively understand pd.Categorical or
+        # timezone-aware timestamps — convert those columns first.
+        df_out = df.copy()
+        df_out["ts"]         = df_out["ts"].astype(str)
+        df_out["event_type"] = df_out["event_type"].astype(str)
+        df_out["country"]    = df_out["country"].astype(str)
+        df_out["device"]     = df_out["device"].astype(str)
+
+        table = pa.Table.from_pandas(df_out, preserve_index=False)
+        pacsv.write_csv(table, str(path))
+        print(f"  Written via pyarrow    {elapsed(t0)}")
+
+    except ImportError:
+        # Fallback: pandas chunked write keeps peak RSS in check
+        CHUNK = 500_000
+        first = True
+        for start in range(0, len(df), CHUNK):
+            chunk = df.iloc[start : start + CHUNK]
+            chunk.to_csv(path, mode="w" if first else "a",
+                         index=False, header=first)
+            first = False
+            print(f"  Written rows {start:>9,} – {min(start+CHUNK, len(df)):>9,}  {elapsed(t0)}")
+
+    size_mb = path.stat().st_size / 1024**2
+    print(f"  File size: {size_mb:.1f} MB")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    print(f"""
+╔══════════════════════════════════════════════════╗
+║          events.csv Generator                    ║
+║  rows   : {N_ROWS:>12,}                          ║
+║  output : {str(OUTPUT_PATH):<38}  ║
+╚══════════════════════════════════════════════════╝""")
+
+    rng = np.random.default_rng(RNG_SEED)
+    t_total = time.perf_counter()
+
+    df, refund_indices, linked_purchase_indices = generate(N_ROWS, rng)
+    report(df, refund_indices, linked_purchase_indices)
+    write_csv(df, OUTPUT_PATH)
+
+    section("Done")
+    print(f"  Total wall time: {elapsed(t_total)}")
+
+
+if __name__ == "__main__":
+    main()
