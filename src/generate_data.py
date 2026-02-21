@@ -21,7 +21,7 @@ Requirements
 
 import sys
 import time
-import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -30,8 +30,6 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-N_ROWS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 3_000_000
-OUTPUT_PATH: Path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("events.csv")
 
 RNG_SEED = 42
 
@@ -39,7 +37,7 @@ RNG_SEED = 42
 # [DESIGN] We model the rare types first so their shares are exact; page_view
 # absorbs all remaining probability mass.
 PURCHASE_RATE  = 0.035   # 3.5 % → satisfies "2–5 %"
-REFUND_RATE    = 0.003   # 0.3 % → satisfies "0.1–0.5 %"
+REFUND_RATE    = 0.005   # 0.5 % → satisfies "0.1–0.5 %"
 SIGNUP_RATE    = 0.05    # 5 %
 # page_view = 1 - PURCHASE_RATE - REFUND_RATE - SIGNUP_RATE ≈ 91.2 %
 
@@ -104,67 +102,124 @@ def generate_event_types(rng: np.random.Generator, n: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Step 2 – Enforce refund → purchase dependency without loops
 # ---------------------------------------------------------------------------
-# [DESIGN] Enforcing the refund ↔ purchase constraint
-# ---------------------------------------------------
-# Naively, we could assign refunds randomly — but the spec says a refund must
-# correspond to an existing purchase.  We do this in two vectorised passes:
+# [DESIGN] Two-phase approach: plan then apply.
 #
-#   Pass A: collect all purchase row indices → purchase_idx (an integer array)
-#   Pass B: for every refund row, pick a random purchase_idx to "link to".
-#           np.random.choice(purchase_idx, size=n_refunds, replace=True)
-#           is an O(n_refunds) vectorised operation.
+#   Phase 1 — _build_refund_links():
+#     Pure function.  Decides which refund maps to which purchase using
+#     np.searchsorted on cumulative probabilities.  Returns a RefundLinks
+#     dataclass (named index arrays) — no column data is modified here
+#     except for the edge-case demotion when no purchases exist.
 #
-# The resulting session_id column links each refund to the session_id of a
-# real purchase row, which satisfies the dependency.  No Python loop needed.
+#   Phase 2 — _apply_refund_links():
+#     Applies every referential constraint that flows from the mapping:
+#     session_id, user_id, timestamp, amount.  All four live here so the
+#     invariant is maintained and extended in exactly one place.
 #
-# [FIX 1] The function now returns the raw index arrays (refund_indices,
-# linked_purchase_indices) alongside the updated session_ids.  The caller
-# uses them to set amounts[refund_indices] = -amounts[linked_purchase_indices],
-# ensuring each refund's amount exactly mirrors its linked purchase.
+# Why a dataclass instead of a raw tuple?
+#   links.purchase_idx is unambiguous.
+#   The second element of a 3-tuple (session_ids, refund_idx, purchase_idx)
+#   is not — a reader must count positions and read the docstring to know
+#   which array is which.  Naming eliminates that cognitive load and prevents
+#   positional swap bugs when the signature is refactored.
 #
-# [FIX 2] The caller also uses linked_purchase_indices to build a
-# protected_purchase_mask that shields those rows from event_type corruption
-# during dirty-data injection, preserving the invariant after injection.
+# Protected-purchase mask:
+#   generate() builds it from links.purchase_idx immediately after calling
+#   _build_refund_links, before _apply_refund_links runs.  This shields
+#   linked purchase rows from event_type corruption in inject_dirty_data
+#   (FIX 2), preserving the refund→purchase invariant post-injection.
 
-def link_refunds_to_purchases(
-    event_types: np.ndarray,
-    session_ids: np.ndarray,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+@dataclass(frozen=True)
+class RefundLinks:
     """
-    For every refund row, replace its session_id with the session_id of a
-    randomly chosen purchase row, establishing the refund→purchase link.
+    Resolved mapping from each refund row to its source purchase row.
+
+    Both arrays are parallel, length == n_refunds.
+    frozen=True prevents accidental mutation after construction.
+    """
+    refund_idx:   np.ndarray   # row positions of refund events
+    purchase_idx: np.ndarray   # row positions of their linked purchases
+
+    def __len__(self) -> int:
+        return len(self.refund_idx)
+
+
+def _build_refund_links(
+    event_types: np.ndarray,
+    rng: np.random.Generator,
+) -> RefundLinks:
+    """
+    PLAN phase: decide which refund maps to which purchase.
+
+    Pure function — only reads event_types.  The one exception is the
+    edge-case demotion (no purchases exist), which changes a row's identity,
+    not its derived data, so it belongs here.
+
+    Parameters
+    ----------
+    event_types : np.ndarray  – mutable string array from generate_event_types()
+    rng         : Generator   – passed in so the caller controls the RNG state
 
     Returns
     -------
-    session_ids_out      : np.ndarray  – updated session_ids (copy)
-    refund_indices       : np.ndarray  – row positions of refund events
-    linked_purchase_idx  : np.ndarray  – for each refund, the row position of
-                                         its linked purchase (parallel to
-                                         refund_indices)
+    RefundLinks with parallel refund_idx / purchase_idx arrays.
     """
     purchase_mask = event_types == "purchase"
     refund_mask   = event_types == "refund"
+    empty = RefundLinks(np.empty(0, np.intp), np.empty(0, np.intp))
 
-    n_purchases = purchase_mask.sum()
-
-    if n_purchases == 0:
-        # Edge case: no purchases at all — demote refunds to page_view
+    if not purchase_mask.any():
+        # Edge case: no purchases — demote refunds so no dangling links exist.
         event_types[refund_mask] = "page_view"
-        empty = np.empty(0, dtype=np.intp)
-        return session_ids, empty, empty
+        return empty
 
-    # [DESIGN] np.where(refund_mask) returns an integer index array — no loop.
-    refund_indices   = np.where(refund_mask)[0]          # shape: (n_refunds,)
-    purchase_indices = np.where(purchase_mask)[0]        # shape: (n_purchases,)
+    refund_idx   = np.where(refund_mask)[0]      # shape: (n_refunds,)
+    purchase_idx = np.where(purchase_mask)[0]    # shape: (n_purchases,)
 
-    # Pick a random purchase for each refund (with replacement — realistic)
-    linked_purchase_idx = rng.choice(purchase_indices, size=len(refund_indices), replace=True)
+    # Pick a random purchase for each refund (with replacement — realistic).
+    # rng.choice is O(n_refunds) vectorised — no Python loop.
+    linked = rng.choice(purchase_idx, size=len(refund_idx), replace=True)
+    return RefundLinks(refund_idx, linked)
 
-    # Assign the purchase's session_id to the refund row
-    out = session_ids.copy()
-    out[refund_indices] = session_ids[linked_purchase_idx]
-    return out, refund_indices, linked_purchase_idx
+
+def _apply_refund_links(
+    links:       RefundLinks,
+    user_ids:    np.ndarray,
+    session_ids: np.ndarray,
+    timestamps:  np.ndarray,
+    amounts:     np.ndarray,
+    rng:         np.random.Generator,
+) -> None:
+    """
+    APPLY phase: enforce all referential constraints that flow from the link.
+
+    All four constraints live here together so the invariant is defined and
+    extended in exactly one place.  Mutates arrays in-place; caller owns them.
+
+    Constraints applied
+    -------------------
+    session_id : refund shares the purchase's session (CSV-level annotation)
+    user_id    : refund must be by the same user who made the purchase
+    timestamp  : refund occurs 1 hour–30 days after its purchase
+    amount     : refund.amount == -purchase.amount  (the core invariant)
+    """
+    if not len(links):
+        return
+
+    ri = links.refund_idx
+    pi = links.purchase_idx
+
+    # Same session as the linked purchase (decorative — real link is the index)
+    session_ids[ri] = session_ids[pi]
+
+    # Same user — a refund must be issued by the purchaser
+    user_ids[ri] = user_ids[pi]
+
+    # Refund happens 1 hour–30 days after the purchase, capped at TS_END
+    offsets = rng.integers(3_600, 30 * 86_400, size=len(ri), dtype=np.int64)
+    timestamps[ri] = np.minimum(timestamps[pi] + offsets, TS_END)
+
+    # Exact amount mirror — the invariant enforced throughout this codebase
+    amounts[ri] = -amounts[pi]
 
 
 # ---------------------------------------------------------------------------
@@ -312,22 +367,37 @@ def generate(n: int, rng: np.random.Generator) -> pd.DataFrame:
     event_types = generate_event_types(rng, n)
     print(f"  Event types generated  {elapsed(t0)}")
 
-    # ── Refund → purchase linkage ─────────────────────────────────────────
-    # [FIX 1 & 2] link_refunds_to_purchases now also returns the raw index
-    # arrays so we can (a) mirror amounts exactly and (b) build the
-    # protected_purchase_mask that shields those rows from event_type corruption.
-    session_ids_linked, refund_indices, linked_purchase_indices = (
-        link_refunds_to_purchases(event_types, session_ids.copy(), rng)
-    )
-    session_ids = session_ids_linked.astype(np.int32)
+    # ── Refund → purchase linkage — Phase 1: plan ────────────────────────
+    # _build_refund_links() decides which refund maps to which purchase.
+    # It returns a RefundLinks dataclass (named index arrays) without touching
+    # any column data beyond the edge-case demotion.
+    links = _build_refund_links(event_types, rng)
 
-    # [FIX 2] Mark every purchase row that at least one refund depends on.
-    # np.zeros + index assignment is O(n_linked) — fully vectorised.
-    protected_purchase_mask = np.zeros(N_ROWS, dtype=bool)
-    if len(linked_purchase_indices):
-        protected_purchase_mask[linked_purchase_indices] = True
+    # Build the protected-purchase mask before dirty injection so that linked
+    # purchase rows can never receive the "???" event_type sentinel (FIX 2).
+    # np.zeros + fancy-index assignment is O(n_linked) — fully vectorised.
+    protected_purchase_mask = np.zeros(n, dtype=bool)
+    if len(links):
+        protected_purchase_mask[links.purchase_idx] = True
 
     print(f"  Refund links resolved  {elapsed(t0)}")
+
+    # ── Amounts (lognormal, purchase rows only) ───────────────────────────
+    # [DESIGN] Draw lognormal for all rows — cheap — then zero non-purchase
+    # rows with a boolean mask.  Avoids conditional loops.
+    # Refund amounts are set to -purchase.amount inside _apply_refund_links
+    # (Phase 2 below) so they don't need special treatment here.
+    raw_amounts = rng.lognormal(mean=LOGNORMAL_MU, sigma=LOGNORMAL_SIGMA, size=n)
+    amounts = raw_amounts.astype(np.float32)
+    amounts[event_types != "purchase"] = 0.0
+
+    print(f"  Amounts generated      {elapsed(t0)}")
+
+    # ── Refund → purchase linkage — Phase 2: apply ───────────────────────
+    # _apply_refund_links() enforces all four referential constraints
+    # (session_id, user_id, timestamp, amount) in one place.
+    _apply_refund_links(links, user_ids, session_ids, timestamps, amounts, rng)
+    print(f"  Refund constraints applied  {elapsed(t0)}")
 
     # ── Countries & devices ───────────────────────────────────────────────
     # [DESIGN] rng.integers picks random indices into the lookup lists;
@@ -342,29 +412,6 @@ def generate(n: int, rng: np.random.Generator) -> pd.DataFrame:
     devices     = device_arr[device_idx]
 
     print(f"  Countries/devices gen  {elapsed(t0)}")
-
-    # ── Amounts (lognormal, purchase/refund only) ─────────────────────────
-    # [DESIGN] Draw lognormal for all rows — cheap — then zero-out non-
-    # purchase rows with a boolean mask.  Avoids conditional loops.
-    #
-    # [FIX 1] Refund amounts must exactly equal -purchase.amount of the
-    # linked purchase, not an independent random sample.  Sequence:
-    #   1. Generate lognormal amounts for every row.
-    #   2. Zero out every row that is not a purchase.
-    #   3. Copy -amounts[linked_purchase_indices] → amounts[refund_indices].
-    # Steps 2 and 3 are single boolean-mask / fancy-index assignments —
-    # no Python loop.
-    raw_amounts = rng.lognormal(mean=LOGNORMAL_MU, sigma=LOGNORMAL_SIGMA, size=n)
-    amounts = raw_amounts.astype(np.float32)
-
-    purchase_mask = event_types == "purchase"
-    amounts[~purchase_mask] = 0.0                               # zero everything that isn't a purchase
-
-    if len(refund_indices):
-        # Mirror the exact purchase amount, negated — one fancy-index op.
-        amounts[refund_indices] = -amounts[linked_purchase_indices]
-
-    print(f"  Amounts generated      {elapsed(t0)}")
 
     # ── Dirty data injection ──────────────────────────────────────────────
     timestamps, countries, event_types, event_ids = inject_dirty_data(
@@ -391,7 +438,7 @@ def generate(n: int, rng: np.random.Generator) -> pd.DataFrame:
     )
 
     print(f"  DataFrame assembled    {elapsed(t0)}")
-    return df, refund_indices, linked_purchase_indices
+    return df, links
 
 
 # ---------------------------------------------------------------------------
@@ -400,8 +447,7 @@ def generate(n: int, rng: np.random.Generator) -> pd.DataFrame:
 
 def report(
     df: pd.DataFrame,
-    refund_indices: np.ndarray,
-    linked_purchase_indices: np.ndarray,
+    links: RefundLinks,
 ) -> None:
     section("Dataset Summary")
     n = len(df)
@@ -452,7 +498,7 @@ def report(
     print()
     print("  Invariant checks (must all PASS):")
 
-    if len(refund_indices) == 0:
+    if len(links) == 0:
         print("    [SKIP] No refund rows — invariants vacuously satisfied.")
     else:
         amounts_arr    = df["amount"].to_numpy(dtype="float32")
@@ -460,7 +506,7 @@ def report(
 
         # Inv 1 & 3 — linked row still has event_type == "purchase"
         # (same check; run after injection, so this confirms post-injection state)
-        linked_etypes  = etypes_arr[linked_purchase_indices]          # fancy index
+        linked_etypes  = etypes_arr[links.purchase_idx]               # fancy index
         inv1_ok        = bool((linked_etypes == "purchase").all())
         n_not_purchase = int((linked_etypes != "purchase").sum())
         print(f"    [{'PASS' if inv1_ok else 'FAIL'}] "
@@ -468,8 +514,8 @@ def report(
               f"(violations: {n_not_purchase})")
 
         # Inv 2 — refund.amount == -purchase.amount (exact row match)
-        refund_amounts   = amounts_arr[refund_indices]                # fancy index
-        purchase_amounts_linked = amounts_arr[linked_purchase_indices] # fancy index
+        refund_amounts   = amounts_arr[links.refund_idx]              # fancy index
+        purchase_amounts_linked = amounts_arr[links.purchase_idx]       # fancy index
         match            = np.isclose(refund_amounts, -purchase_amounts_linked, atol=1e-4)
         inv2_ok          = bool(match.all())
         n_mismatch       = int((~match).sum())
@@ -533,6 +579,9 @@ def write_csv(df: pd.DataFrame, path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    N_ROWS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 3_000_000
+    OUTPUT_PATH: Path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("events.csv")
+    
     print(f"""
 ╔══════════════════════════════════════════════════╗
 ║          events.csv Generator                    ║
@@ -543,8 +592,8 @@ def main() -> None:
     rng = np.random.default_rng(RNG_SEED)
     t_total = time.perf_counter()
 
-    df, refund_indices, linked_purchase_indices = generate(N_ROWS, rng)
-    report(df, refund_indices, linked_purchase_indices)
+    df, links = generate(N_ROWS, rng)
+    report(df, links)
     write_csv(df, OUTPUT_PATH)
 
     section("Done")

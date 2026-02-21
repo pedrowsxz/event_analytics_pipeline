@@ -1014,7 +1014,73 @@ class TestFunnel(unittest.TestCase):
             self.assertEqual(row["signup_to_purchase"], 0.0)
         except ZeroDivisionError:
             self.fail("_metric_funnel raised ZeroDivisionError on zero signups")
+# ------------------ add the following near the end of test_pipeline.py ------------------
 
+class TestGenerateRefundLinking(unittest.TestCase):
+    """
+    Generator-level checks: refund rows must mirror their linked purchase
+    in amount, session_id, user_id, and timestamp.
+    """
+
+    def test_generate_refund_links_to_purchase(self):
+        try:
+            # Change 1: import from flat module (no src. prefix) + import RefundLinks
+            from src.generate_data import generate, RefundLinks
+        except Exception as e:
+            self.skipTest(f"generate_data not importable: {e}")
+
+        rng = np.random.default_rng(42)
+
+        # Change 2: unpack (df, links) — not a 3-tuple anymore
+        df, links = generate(50_000, rng)
+
+        if len(links) == 0:
+            self.skipTest("No refunds in this sample (increase n or change seed)")
+
+        # Optional but explicit: confirm the return type
+        self.assertIsInstance(links, RefundLinks)
+
+        user_arr    = df["user_id"].to_numpy()
+        amount_arr  = df["amount"].to_numpy(dtype="float32")
+        session_arr = df["session_id"].to_numpy()
+        ts_arr      = df["ts"].to_numpy()
+
+        # Change 3: timestamp invariant — exclude dirty-injection casualties.
+        # inject_dirty_data may overwrite a purchase's timestamp to 2099,
+        # making it larger than the refund's real timestamp. That's expected
+        # behaviour of the dirty injector, not a bug in the linking logic.
+        # We only assert on pairs where neither endpoint was corrupted.
+        year_ok = (df["ts"].dt.year < 2099).to_numpy()
+        clean_pairs = year_ok[links.refund_idx] & year_ok[links.purchase_idx]
+        if clean_pairs.any():
+            self.assertTrue(
+                (ts_arr[links.refund_idx[clean_pairs]]
+                    > ts_arr[links.purchase_idx[clean_pairs]]).all(),
+                msg="Refund timestamp must be later than linked purchase timestamp"
+                    " (clean pairs only — dirty-injection pairs excluded)",
+            )
+
+        # Amount invariant: refund.amount == -purchase.amount
+        self.assertTrue(
+            np.allclose(
+                amount_arr[links.refund_idx],
+                -amount_arr[links.purchase_idx],
+                atol=1e-4,
+            ),
+            msg="Refund amounts must mirror linked purchase amounts (negated)",
+        )
+
+        # session_id equality
+        self.assertTrue(
+            (session_arr[links.refund_idx] == session_arr[links.purchase_idx]).all(),
+            msg="Refund session_id must equal linked purchase's session_id",
+        )
+
+        # user_id equality (enforced by _apply_refund_links)
+        self.assertTrue(
+            (user_arr[links.refund_idx] == user_arr[links.purchase_idx]).all(),
+            msg="Refund user_id must equal linked purchase's user_id",
+        )
 
 # ===========================================================================
 # Entry point — runs with plain `python test_pipeline.py`
