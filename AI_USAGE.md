@@ -58,7 +58,7 @@ event_ids[dup_indices] = ids_snapshot[src]
 
 ### Prompt 3 — Architecture review after I modified the file
 
-> I noticed that it first links refunds to purchases using session_id, then only inside `generate()` it links user_id and fixes the amounts. Is it correct? Does it align with good code architecture? How would you change it?
+> I noticed that it first links refunds to purchases using session_id, then only inside `generate()` it links user_id and fixes the amounts. So the refuns to purchase linkage was separated into two functions, it was bad architeture.
 
 **What the AI said:** The linking logic was split across two places with no clear boundary — `link_refunds_to_purchases()` handled `session_id`, while `user_id`, `timestamp`, and `amount` were scattered through `generate()`. It proposed replacing the raw 3-tuple return with a named `RefundLinks` dataclass and splitting into `_build_refund_links()` (plan) and `_apply_refund_links()` (apply all four constraints in one place).
 
@@ -99,15 +99,9 @@ protected_purchase_mask = np.zeros(n, dtype=bool)
 
 This only worked in production because `main()` happened to pass `N_ROWS` as `n`. Any test calling `generate(100, rng)` would silently create a 3M-element mask.
 
-### Correction 3 — Stale comment after changing a constant
+### Correction 3 — It didn't create the `__init__` files inside src/ and tests/ folders
 
-```python
-# AI wrote (rate is 0.005 = 0.5%, comment says 0.3%)
-REFUND_RATE = 0.005   # 0.3 % → satisfies "0.1–0.5 %"
-
-# I fixed the comment
-REFUND_RATE = 0.005   # 0.5 % → satisfies "0.1–0.5 %"
-```
+If it does not create the `__init__` file inside a folder, it will not explicitly define them as regular Python packages, not enabling their contents to be imported as modules
 
 ### Correction 4 — Missing behavioural contracts for refunds
 
@@ -128,7 +122,7 @@ timestamps[refund_indices] = np.minimum(
 
 **Running the invariant checker.** The AI wrote a `report()` function that checks `event_type == "purchase"` on all linked rows and `refund.amount == -purchase.amount` on all pairs. I ran this after every change and treated any `[FAIL]` as a blocker.
 
-**Checking the dirty-data counts.** The output prints how many rows were corrupted per type. I verified each was close to 0.5% of 3M rows (~15,000), not zero or suspiciously low.
+**Checking the logged outputs of the print() calls.** The output prints how many rows were corrupted per type. I verified each was close to 0.5% of 3M rows (~15,000), not zero or suspiciously low.
 
 **Checking the return signature.** After seeing the AI return a 3-tuple `(session_ids, refund_idx, purchase_idx)` where the first element was immediately re-assigned by the caller, I noticed something was off. That observation is what led to the architecture prompt.
 
