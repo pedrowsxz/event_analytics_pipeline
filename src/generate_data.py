@@ -125,8 +125,8 @@ def generate_event_types(rng: np.random.Generator, n: int) -> np.ndarray:
 # Protected-purchase mask:
 #   generate() builds it from links.purchase_idx immediately after calling
 #   _build_refund_links, before _apply_refund_links runs.  This shields
-#   linked purchase rows from event_type corruption in inject_dirty_data
-#   (FIX 2), preserving the refund→purchase invariant post-injection.
+#   linked purchase rows from event_type corruption in inject_dirty_data,
+#   preserving the refund→purchase invariant post-injection.
 
 @dataclass(frozen=True)
 class RefundLinks:
@@ -225,36 +225,6 @@ def _apply_refund_links(
 # ---------------------------------------------------------------------------
 # Step 3 – Inject dirty data without loops
 # ---------------------------------------------------------------------------
-# [DESIGN] Dirty-data injection without Python loops
-# --------------------------------------------------
-# We compute a boolean mask for each corruption type using a single
-# rng.random(n) < DIRTY_RATE comparison — this is a vectorised boolean
-# array.  Then:
-#
-#   • Invalid timestamps  → assign a fixed out-of-range integer (year 2099).
-#   • Null countries      → assign empty string ""; becomes NaN after
-#                           pd.Categorical if desired, or stays "" for CSV.
-#   • Invalid event_type  → assign the sentinel string "???".
-#   • Duplicate event_id  → copy the event_id from a random source row using
-#                           fancy indexing on a pre-mutation snapshot.
-#
-# All four injections use fancy indexing on NumPy arrays — O(n) vectorised.
-#
-# [FIX 2] protected_purchase_mask is a boolean array that is True for every
-# purchase row that at least one refund depends on.  It is AND-ed out of
-# etype_mask so those rows can never receive the "???" sentinel, preserving
-# the refund → purchase invariant after dirty injection.
-# Other dirty types (timestamps, countries) are intentionally still allowed
-# on protected rows — the invariant only requires event_type == "purchase".
-#
-# [FIX 3] Duplicate injection:
-#   • We take a snapshot of event_ids before any mutation so that
-#     event_ids[dup_indices] = snapshot[src] is always a copy from an
-#     original value — no "chain duplicates" where a row copies from a row
-#     that was itself already overwritten.
-#   • Self-copies (src == target index) are eliminated by shifting src by +1
-#     mod n, which is a single vectorised assignment — no Python loop.
-#     The shift introduces negligible distribution bias at millions of rows.
 
 INVALID_TS = int(pd.Timestamp("2099-01-01", tz="UTC").timestamp())  # year 2099
 
@@ -275,7 +245,7 @@ def inject_dirty_data(
 
     ts_mask      = r[0] < DIRTY_RATE
     country_mask = r[1] < DIRTY_RATE
-    # [FIX 2] Exclude protected purchase rows from event_type corruption.
+    # Exclude protected purchase rows from event_type corruption.
     etype_mask   = (r[2] < DIRTY_RATE) & ~protected_purchase_mask
     dup_mask     = r[3] < DIRTY_RATE
 
@@ -306,36 +276,6 @@ def inject_dirty_data(
 
     return timestamps, countries, event_types, event_ids
 
-
-# ---------------------------------------------------------------------------
-# Step 4 – Memory-efficient considerations
-# ---------------------------------------------------------------------------
-# [DESIGN] Memory discipline for 3 M rows
-# ----------------------------------------
-# At 3 M rows × 8 columns a naïve approach wastes GB of RAM.  We apply:
-#
-#   • int32 for user_id, session_id        → 4 B/cell vs 8 B
-#   • int64 for timestamps (Unix seconds)  → compact, no object overhead
-#   • float32 for amount                   → 4 B, sufficient for cents
-#   • pd.Categorical for event_type, country, device (≤10 distinct values)
-#     A Categorical column stores one int8 code per row + a tiny lookup table
-#     → ~1 B/row instead of ~50 B/row for a Python string object.
-#   • We build all columns as NumPy arrays first, then construct one
-#     DataFrame at the end — avoids repeated reallocation.
-#   • We write CSV via to_csv() with chunksize to cap peak memory; for very
-#     large files pyarrow's write_csv is 3-4× faster and memory-friendlier.
-#
-# Rough RAM budget for 3 M rows after dtype discipline:
-#   event_id   : int64  24 MB
-#   user_id    : int32  12 MB
-#   ts         : int64  24 MB
-#   event_type : Cat    ~3 MB   (int8 codes)
-#   amount     : float32 12 MB
-#   country    : Cat    ~3 MB
-#   device     : Cat    ~3 MB
-#   session_id : int32  12 MB
-#   ─────────────────────────
-#   Total ≈ 93 MB  (vs ~1.8 GB with object columns + int64 everywhere)
 
 
 # ---------------------------------------------------------------------------
