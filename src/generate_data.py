@@ -258,7 +258,7 @@ def inject_dirty_data(
     # 3. Invalid event_type
     event_types[etype_mask] = "???"
 
-    # 4. Duplicate event_ids — [FIX 3]
+    # 4. Duplicate event_ids — fix
     n_dups = dup_mask.sum()
     if n_dups > 0:
         dup_indices = np.where(dup_mask)[0]          # exact target positions
@@ -361,9 +361,6 @@ def generate(n: int, rng: np.random.Generator) -> pd.DataFrame:
     print(f"  Dirty data injected    {elapsed(t0)}")
 
     # ── Assemble DataFrame with dtype discipline ──────────────────────────
-    # [DESIGN] pd.Categorical for low-cardinality string columns.
-    # This is the single biggest memory win: each cell goes from ~50 bytes
-    # (Python str object) to 1 byte (int8 category code).
     df = pd.DataFrame(
         {
             "event_id":   pd.array(event_ids,  dtype="int64"),

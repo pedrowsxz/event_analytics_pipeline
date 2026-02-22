@@ -96,11 +96,11 @@ All vectorised with boolean masks — no Python row loops.
 - `np.searchsorted` for event-type bucketing (~O(N log k))
 - Boolean fancy indexing for conditional updates
 
-**Memory Discipline**
+**Memory Efficiency**
 - `int32` for user_id, session_id (4 B vs 8 B)
 - `float32` for amounts (sufficient for currency)
-- `pd.Categorical` for low-cardinality strings (~1 B/row vs 50 B)
-- Result: ~93 MB for 3M rows (vs ~1.8 GB naive approach)
+- `pd.Categorical` for low-cardinality strings (~1 B/row vs 50 B in Pythn string)
+- Result: ~200 MB for 3M rows (vs ~1.8 GB naive approach)
 
 **I/O**
 - Optional chunked CSV reads for files > RAM
@@ -127,12 +127,14 @@ All vectorised with boolean masks — no Python row loops.
 ### Refund→Purchase Invariant
 
 Critical design constraint: every refund must link to an existing purchase with matching amount and user.
+Refund linkage is now explicitly split into:
 
-**Enforcement (vectorised, no loops)**
-1. `link_refunds_to_purchases()` — reassigns refund session_ids to random purchase session_ids
-2. User IDs copied: `user_ids[refund_idx] = user_ids[linked_purchase_idx]`
-3. Amounts mirrored: `amounts[refund_idx] = -amounts[linked_purchase_idx]`
-4. Protected purchases from event_type corruption during dirty injection
+1. Phase 1 — Planning: `_build_refund_links()`
+Pure function. Determines which refund maps to which purchase.
+
+2. Phase 2 — Application: `_apply_refund_links()`
+Enforces all referential constraints in one place.
+
 
 ## Metrics
 
